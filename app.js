@@ -89,7 +89,7 @@ function initializeUi() {
     }
   });
 
-  setStatus("請先創建房間，再按加入房間。");
+  setStatus("可輸入房號加入，或先創建房間再加入。");
 }
 
 function applySavedTheme() {
@@ -187,11 +187,12 @@ function renderBoard(gridState = {}, seatsState = {}) {
 }
 
 async function joinRoom() {
-  const roomId = roomInput.value.trim();
+  const roomId = sanitizeRoomId(roomInput.value);
   if (!roomId) {
-    setStatus("請先點擊創建房間。");
+    setStatus("請輸入有效房號，或先點擊創建房間。");
     return;
   }
+  roomInput.value = roomId;
 
   const name = (nameInput.value || "未命名玩家").trim().slice(0, 20) || "未命名玩家";
   localStorage.setItem("board-nickname", name);
@@ -632,6 +633,10 @@ function createRoomId() {
   const arr = new Uint32Array(4);
   crypto.getRandomValues(arr);
   return `${arr[0].toString(36)}-${arr[1].toString(36)}-${arr[2].toString(36)}-${arr[3].toString(36)}`;
+}
+
+function sanitizeRoomId(input) {
+  return String(input).trim().toLowerCase().replace(/[^a-z0-9-_]/g, "").slice(0, 48);
 }
 
 function getOrCreateClientId() {
