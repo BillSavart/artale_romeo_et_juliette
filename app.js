@@ -1,16 +1,23 @@
-// 【修改點】移除了 import Peer from "peerjs";
+// ====== 引入 Firebase 核心套件 ======
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-app.js";
+import { getDatabase, ref, set, get, onValue, update, remove, onDisconnect, off } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-database.js";
 
-// 【修改點】新增 STUN 伺服器設定，大幅提高 P2P 穿透成功率
-const PEER_CONFIG = {
-  config: {
-    iceServers: [
-      { urls: "stun:stun.l.google.com:19302" },
-      { urls: "stun:stun1.l.google.com:19302" },
-      { urls: "stun:global.stun.twilio.com:3478" } // 多加一個 Twilio 的備用，增加穩定性
-    ]
-  }
+// ====== Firebase 設定 (使用你的專屬金鑰) ======
+const firebaseConfig = {
+  apiKey: "AIzaSyAmfHGNhM-qLI_i772aT5Sh-VdrYIJNks0",
+  authDomain: "artale-romeo-et-juliette.firebaseapp.com",
+  databaseURL: "https://artale-romeo-et-juliette-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "artale-romeo-et-juliette",
+  storageBucket: "artale-romeo-et-juliette.firebasestorage.app",
+  messagingSenderId: "984532908971",
+  appId: "1:984532908971:web:45ebb6bedce192039770ee",
+  measurementId: "G-RXZ7YHJ5F5"
 };
 
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+
+// ====== 遊戲常數與 DOM 元素 ======
 const PLAYER_META = {
   1: { color: "#ff2d55" },
   2: { color: "#00a6fb" },
@@ -19,8 +26,6 @@ const PLAYER_META = {
 };
 
 const LEVELS = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-const HEARTBEAT_MS = 5000;
-const SEAT_STALE_MS = 15000;
 
 const roomInput = document.querySelector("#roomInput");
 const generateRoomBtn = document.querySelector("#generateRoomBtn");
@@ -34,19 +39,15 @@ const statusText = document.querySelector("#statusText");
 const board = document.querySelector("#board");
 const themeToggleBtn = document.querySelector("#themeToggleBtn");
 
+// ====== 全局狀態變數 ======
 let uid = getOrCreateClientId();
 let mySeat = null;
+let mySeatRef = null;
 let activeRoomId = null;
-let peer = null;
-let isHost = false;
-let hostPeerId = null;
-let hostConnection = null;
-let clients = new Map();
-let heartbeatTimer = null;
-let staleCleanupTimer = null;
 let latestSnapshot = createEmptySnapshot();
 let myDisplayName = "未命名玩家";
 
+// ====== 啟動 ======
 initializeUi();
 
 function initializeUi() {
@@ -59,7 +60,7 @@ function initializeUi() {
   renderBoard();
 
   joinBtn.addEventListener("click", joinRoom);
-  leaveBtn.addEventListener("click", leaveRoom);
+  leaveBtn.addEventListener("click", () => leaveRoom(false));
   resetBtn.addEventListener("click", resetBoard);
   generateRoomBtn.addEventListener("click", () => {
     if (activeRoomId) {
@@ -72,26 +73,11 @@ function initializeUi() {
   copyRoomBtn.addEventListener("click", copyRoomId);
   themeToggleBtn.addEventListener("click", toggleTheme);
   board.addEventListener("click", handleBoardClick);
-  
-  // 【彩蛋補充】把我們剛剛討論的「死路標記（紅X）」補回來給你，使用右鍵觸發！
-  board.addEventListener("contextmenu", (event) => {
-    event.preventDefault();
-    const button = event.target.closest("button.cell");
-    if (!button || !activeRoomId) return;
-    
-    // 改變按鈕的背景色為灰色，代表死路 (僅限本機視覺)
-    if (button.style.backgroundColor === "gray") {
-      button.style.backgroundColor = "";
-      button.textContent = "";
-    } else {
-      button.style.backgroundColor = "gray";
-      button.textContent = "X";
-    }
-  });
 
   setStatus("可輸入房號加入，或先創建房間再加入。");
 }
 
+/* --- 主題與外觀 --- */
 function applySavedTheme() {
   const savedTheme = localStorage.getItem("board-theme");
   const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -126,13 +112,8 @@ function renderSeatButtons(seatsState = {}) {
   [1, 2, 3, 4].forEach((seat) => {
     const seatData = seatsState[seat];
     const button = document.createElement("button");
-    button.type = "button";
     button.className = "seat-btn";
-    button.dataset.seat = String(seat);
-
-    if (mySeat === seat) {
-      button.classList.add("selected");
-    }
+    if (mySeat === seat) button.classList.add("selected");
     button.disabled = true;
 
     const seatName = getSeatDisplayName(seat, seatData);
@@ -143,14 +124,12 @@ function renderSeatButtons(seatsState = {}) {
       <span class="label">${seatName}</span>
       ${seatState ? `<span class="seat-state">${seatState}</span>` : ""}
     `;
-
     seatPicker.appendChild(button);
   });
 }
 
 function renderBoard(gridState = {}, seatsState = {}) {
   board.innerHTML = "";
-
   LEVELS.forEach((level) => {
     const row = document.createElement("div");
     row.className = "board-row";
@@ -164,382 +143,154 @@ function renderBoard(gridState = {}, seatsState = {}) {
       const key = `L${level}-${seat}`;
       const markerSeat = gridState[key] || null;
       const button = document.createElement("button");
-      button.type = "button";
       button.className = "cell";
       button.dataset.level = String(level);
       button.dataset.seat = String(seat);
-      button.title = `第 ${level} 層 - 第 ${seat} 欄`;
 
       if (markerSeat) {
         button.classList.add("active");
         button.style.backgroundColor = PLAYER_META[markerSeat].color;
         button.textContent = getSeatDisplayName(markerSeat, seatsState[markerSeat]);
-      } else {
-        button.textContent = "";
       }
-
       button.disabled = !activeRoomId;
       row.appendChild(button);
     });
-
     board.appendChild(row);
   });
 }
 
+/* --- Firebase 核心連線邏輯 --- */
 async function joinRoom() {
   const roomId = sanitizeRoomId(roomInput.value);
   if (!roomId) {
     setStatus("請輸入有效房號，或先點擊創建房間。");
     return;
   }
-  roomInput.value = roomId;
-
-  const name = (nameInput.value || "未命名玩家").trim().slice(0, 20) || "未命名玩家";
+  
+  const name = (nameInput.value || "未命名玩家").trim().slice(0, 20);
   localStorage.setItem("board-nickname", name);
 
-  if (activeRoomId) {
-    await leaveRoom();
-  }
+  if (activeRoomId) await leaveRoom(true);
 
   activeRoomId = roomId;
   myDisplayName = name;
-  hostPeerId = makeHostPeerId(roomId);
 
   joinBtn.disabled = true;
   leaveBtn.disabled = true;
   resetBtn.disabled = true;
   generateRoomBtn.disabled = true;
-
   setStatus(`正在加入房間 ${roomId}...`);
 
   try {
-    await connectAsHostOrClient(roomId, name);
-  } catch (error) {
-    setStatus(`加入失敗：${error?.message || "未知錯誤"}`);
-    await leaveRoom(true);
-    return;
-  }
+    const roomRef = ref(db, `rooms/${activeRoomId}`);
+    const seatsRef = ref(db, `rooms/${activeRoomId}/seats`);
+    
+    // 1. 抓取目前座位狀況
+    const snapshot = await get(seatsRef);
+    const currentSeats = snapshot.val() || {};
 
-  leaveBtn.disabled = false;
-  resetBtn.disabled = false;
-  setStatus(`已加入房間 ${roomId}，目前玩家：${mySeat ? `玩家 ${mySeat}` : "尚未分配"}。`);
-}
-
-async function copyRoomId() {
-  const roomId = roomInput.value.trim();
-  if (!roomId) {
-    setStatus("目前沒有可複製的房號，請先創建房間。");
-    return;
-  }
-
-  try {
-    await navigator.clipboard.writeText(roomId);
-    setStatus("房號已複製。");
-  } catch {
-    roomInput.focus();
-    roomInput.select();
-    const copied = document.execCommand("copy");
-    setStatus(copied ? "房號已複製。" : "複製失敗，請手動複製房號。");
-  }
-}
-
-async function connectAsHostOrClient(roomId, name) {
-  try {
-    const hostPeer = await openPeerWithId(hostPeerId);
-    peer = hostPeer;
-    isHost = true;
-    becomeHost(name);
-    claimSeatOnHost(uid, name, peer.id);
-    startTimers();
-    publishSnapshot();
-    return;
-  } catch (error) {
-    if (!String(error?.message || "").includes("ID") && !String(error?.type || "").includes("unavailable")) {
-      throw error;
+    // 2. 尋找座位 (優先找自己原本的，沒有的話找空位)
+    let targetSeat = null;
+    for (let i = 1; i <= 4; i++) {
+      if (currentSeats[i] && currentSeats[i].uid === uid) {
+        targetSeat = i; break;
+      }
     }
-  }
-
-  peer = await openPeerRandom();
-  isHost = false;
-
-  peer.on("connection", (incoming) => {
-    incoming.on("open", () => {
-      incoming.close();
-    });
-  });
-
-  hostConnection = peer.connect(hostPeerId, {
-    reliable: true,
-    serialization: "json"
-  });
-
-  await waitForConnectionOpen(hostConnection, 8000);
-  setupHostConnectionListeners(hostConnection);
-
-  hostConnection.send({
-    type: "hello",
-    payload: { uid, name, peerId: peer.id }
-  });
-
-  hostConnection.send({
-    type: "claim-seat",
-    payload: { uid, name, peerId: peer.id }
-  });
-
-  startTimers();
-}
-
-function becomeHost(name) {
-  latestSnapshot = createEmptySnapshot();
-  peer.on("connection", (conn) => setupClientConnection(conn));
-  setStatus(`你是房主，正在分發房間 ${activeRoomId} 狀態。`);
-  claimSeatOnHost(uid, name, peer.id);
-}
-
-function setupClientConnection(conn) {
-  conn.on("open", () => {
-    clients.set(conn.peer, conn);
-    conn.on("data", (message) => handleClientMessage(conn, message));
-    conn.on("close", () => {
-      clients.delete(conn.peer);
-      releaseSeatByPeerId(conn.peer);
-      publishSnapshot();
-    });
-    conn.on("error", () => {
-      clients.delete(conn.peer);
-      releaseSeatByPeerId(conn.peer);
-      publishSnapshot();
-    });
-    publishSnapshotTo(conn);
-  });
-}
-
-function setupHostConnectionListeners(conn) {
-  conn.on("data", (message) => {
-    if (!message || typeof message !== "object") return;
-
-    if (message.type === "snapshot") {
-      applySnapshot(message.payload);
-      return;
+    if (!targetSeat) {
+      for (let i = 1; i <= 4; i++) {
+        if (!currentSeats[i]) {
+          targetSeat = i; break;
+        }
+      }
     }
-    if (message.type === "room-full") {
+
+    if (!targetSeat) {
       setStatus("房間已滿（4/4），請稍後再試。");
+      await leaveRoom(true);
       return;
     }
-    if (message.type === "host-closing") {
-      setStatus("房主已離線，請重新加入房間。\n");
-    }
-  });
 
-  conn.on("close", () => {
-    if (activeRoomId) {
-      setStatus("與房主中斷連線，請重新加入房間。");
-      leaveRoom(true);
-    }
-  });
+    // 3. 佔據座位並設定斷線自動離開
+    mySeat = targetSeat;
+    mySeatRef = ref(db, `rooms/${activeRoomId}/seats/${mySeat}`);
+    await set(mySeatRef, { uid, name: myDisplayName });
+    onDisconnect(mySeatRef).remove(); // 斷線時 Firebase 會自動清空這格
 
-  conn.on("error", () => {
-    if (activeRoomId) {
-      setStatus("連線異常，請重新加入房間。");
-      leaveRoom(true);
-    }
-  });
-}
+    // 4. 開始即時監聽房間變化
+    onValue(roomRef, (roomSnapshot) => {
+      const data = roomSnapshot.val() || { seats: {}, grid: {} };
+      latestSnapshot.seats = data.seats || {};
+      latestSnapshot.grid = data.grid || {};
 
-function handleClientMessage(conn, message) {
-  if (!message || typeof message !== "object") return;
-  const payload = message.payload || {};
+      // 檢查：如果有其他玩家斷線遺留了標記，順手幫忙清掉
+      autoCleanupOrphanedGrid(latestSnapshot.seats, latestSnapshot.grid);
 
-  if (message.type === "hello") {
-    claimSeatOnHost(payload.uid, payload.name, payload.peerId || conn.peer, false);
-    publishSnapshot();
-  } else if (message.type === "claim-seat") {
-    const seat = claimSeatOnHost(payload.uid, payload.name, payload.peerId || conn.peer, true);
-    if (seat === null) safeSend(conn, { type: "room-full" });
-    publishSnapshot();
-  } else if (message.type === "heartbeat") {
-    updateSeatHeartbeat(payload.uid, payload.name, payload.peerId || conn.peer);
-    publishSnapshot();
-  } else if (message.type === "set-cell") {
-    applySetCellFromUser(payload.uid, payload.level, payload.seat);
-    publishSnapshot();
-  } else if (message.type === "reset") {
-    applyResetFromUser(payload.uid);
-    publishSnapshot();
-  } else if (message.type === "leave") {
-    releaseSeatByUid(payload.uid);
-    publishSnapshot();
+      renderSeatButtons(latestSnapshot.seats);
+      renderBoard(latestSnapshot.grid, latestSnapshot.seats);
+      setStatus(`連線狀態：已連線，房內 ${Object.keys(latestSnapshot.seats).length} 人`);
+    });
+
+    leaveBtn.disabled = false;
+    resetBtn.disabled = false;
+
+  } catch (error) {
+    console.error(error);
+    setStatus(`加入失敗：檢查網路或資料庫權限。`);
+    await leaveRoom(true);
   }
 }
 
-function claimSeatOnHost(targetUid, targetName, targetPeerId, strictCapacity = false) {
-  if (!isHost) return null;
+function handleBoardClick(event) {
+  const button = event.target.closest("button.cell");
+  if (!button || !activeRoomId || !mySeat) return;
 
-  const existingSeat = getSeatByUid(targetUid, latestSnapshot.seats);
-  if (existingSeat) {
-    const seatData = latestSnapshot.seats[existingSeat];
-    latestSnapshot.seats[existingSeat] = {
-      ...seatData,
-      name: (targetName || seatData.name || "未命名玩家").slice(0, 20),
-      peerId: targetPeerId || seatData.peerId,
-      lastSeen: Date.now()
-    };
-    if (targetUid === uid) mySeat = existingSeat;
-    return existingSeat;
-  }
+  const clickedColumn = Number(button.dataset.seat);
+  const level = Number(button.dataset.level);
 
-  const openSeat = [1, 2, 3, 4].find((seat) => !latestSnapshot.seats[seat]);
-  if (!openSeat) return strictCapacity ? null : existingSeat;
-
-  latestSnapshot.seats[openSeat] = {
-    uid: targetUid,
-    name: (targetName || "未命名玩家").slice(0, 20),
-    peerId: targetPeerId,
-    color: PLAYER_META[openSeat].color,
-    seat: openSeat,
-    lastSeen: Date.now()
-  };
-
-  if (targetUid === uid) mySeat = openSeat;
-  return openSeat;
-}
-
-function updateSeatHeartbeat(targetUid, targetName, targetPeerId) {
-  if (!isHost) return;
-  const seat = getSeatByUid(targetUid, latestSnapshot.seats);
-  if (!seat) {
-    claimSeatOnHost(targetUid, targetName, targetPeerId, false);
-    return;
-  }
-  latestSnapshot.seats[seat] = {
-    ...latestSnapshot.seats[seat],
-    name: (targetName || latestSnapshot.seats[seat].name || "未命名玩家").slice(0, 20),
-    peerId: targetPeerId || latestSnapshot.seats[seat].peerId,
-    lastSeen: Date.now()
-  };
-}
-
-function applySetCellFromUser(targetUid, level, seat) {
-  const targetSeat = getSeatByUid(targetUid, latestSnapshot.seats);
-  if (!targetSeat) return;
-  const targetColumn = Number(seat);
-  const targetLevel = Number(level);
-  if (!LEVELS.includes(targetLevel)) return;
-  if (![1, 2, 3, 4].includes(targetColumn)) return;
-
-  // 同一層只保留該玩家一個格子：先移除舊位置，再設為新位置。
-  [1, 2, 3, 4].forEach((column) => {
-    const key = `L${targetLevel}-${column}`;
-    if (Number(latestSnapshot.grid[key]) === targetSeat) {
-      delete latestSnapshot.grid[key];
+  // 準備一包更新資料：把同一層的舊位置清空，並設定新位置
+  const updates = {};
+  [1, 2, 3, 4].forEach(col => {
+    if (latestSnapshot.grid[`L${level}-${col}`] === mySeat) {
+      updates[`L${level}-${col}`] = null;
     }
   });
+  updates[`L${level}-${clickedColumn}`] = mySeat;
 
-  latestSnapshot.grid[`L${targetLevel}-${targetColumn}`] = targetSeat;
+  // 一次性推送給 Firebase
+  update(ref(db, `rooms/${activeRoomId}/grid`), updates);
 }
 
-function applyResetFromUser(targetUid) {
-  if (!getSeatByUid(targetUid, latestSnapshot.seats)) return;
-  latestSnapshot.grid = {};
-}
-
-function applySnapshot(snapshot) {
-  if (!snapshot || typeof snapshot !== "object") return;
-
-  latestSnapshot = {
-    seats: { ...(snapshot.seats || {}) },
-    grid: { ...(snapshot.grid || {}) },
-    hostPeerId: snapshot.hostPeerId || hostPeerId || "",
-    ts: Number(snapshot.ts) || Date.now()
-  };
-
-  mySeat = getSeatByUid(uid, latestSnapshot.seats) || null;
-
-  renderSeatButtons(latestSnapshot.seats);
-  renderBoard(latestSnapshot.grid, latestSnapshot.seats);
-
-  const roleText = isHost ? "房主" : "玩家";
-  const connectedPlayers = Object.keys(latestSnapshot.seats).length;
-  setStatus(`連線狀態：${roleText}，房內 ${connectedPlayers} 人`);
-}
-
-function publishSnapshot() {
-  if (!isHost) return;
-  latestSnapshot.hostPeerId = hostPeerId;
-  latestSnapshot.ts = Date.now();
-  cleanupStaleSeats();
-  applySnapshot(latestSnapshot);
-  clients.forEach((conn) => publishSnapshotTo(conn));
-}
-
-function publishSnapshotTo(conn) {
-  safeSend(conn, { type: "snapshot", payload: latestSnapshot });
-}
-
-function safeSend(conn, message) {
-  if (!conn || !conn.open) return;
-  try {
-    conn.send(message);
-  } catch {}
-}
-
-function cleanupStaleSeats() {
-  const now = Date.now();
-  [1, 2, 3, 4].forEach((seat) => {
-    const seatData = latestSnapshot.seats[seat];
-    if (seatData && now - seatData.lastSeen > SEAT_STALE_MS) {
-      delete latestSnapshot.seats[seat];
-      clearGridBySeat(seat);
-    }
-  });
-}
-
-function clearGridBySeat(seat) {
-  Object.keys(latestSnapshot.grid).forEach((key) => {
-    if (Number(latestSnapshot.grid[key]) === Number(seat)) {
-      delete latestSnapshot.grid[key];
-    }
-  });
-}
-
-function releaseSeatByUid(targetUid) {
-  const seat = getSeatByUid(targetUid, latestSnapshot.seats);
-  if (seat) {
-    delete latestSnapshot.seats[seat];
-    clearGridBySeat(seat);
-  }
-}
-
-function releaseSeatByPeerId(targetPeerId) {
-  const seat = [1, 2, 3, 4].find((candidate) => latestSnapshot.seats[candidate]?.peerId === targetPeerId);
-  if (seat) {
-    delete latestSnapshot.seats[seat];
-    clearGridBySeat(seat);
-  }
+function resetBoard() {
+  if (!activeRoomId || !mySeat) return;
+  // 直接清空整個網格資料
+  remove(ref(db, `rooms/${activeRoomId}/grid`));
 }
 
 async function leaveRoom(silent = false) {
   if (activeRoomId) {
-    if (isHost) {
-      clients.forEach((conn) => {
-        safeSend(conn, { type: "host-closing" });
-        conn.close();
-      });
-      clients.clear();
-    } else if (hostConnection?.open) {
-      safeSend(hostConnection, { type: "leave", payload: { uid } });
-      hostConnection.close();
+    // 停止監聽資料庫
+    off(ref(db, `rooms/${activeRoomId}`));
+    
+    // 離開時，清除自己留在地圖上的格子
+    const myGridUpdates = {};
+    Object.keys(latestSnapshot.grid).forEach(key => {
+      if (latestSnapshot.grid[key] === mySeat) {
+        myGridUpdates[key] = null;
+      }
+    });
+    if (Object.keys(myGridUpdates).length > 0) {
+      update(ref(db, `rooms/${activeRoomId}/grid`), myGridUpdates);
+    }
+
+    // 讓出座位
+    if (mySeatRef) {
+      onDisconnect(mySeatRef).cancel();
+      await remove(mySeatRef);
+      mySeatRef = null;
     }
   }
 
-  stopTimers();
-  if (peer) peer.destroy();
-
-  peer = null;
-  hostConnection = null;
   activeRoomId = null;
-  isHost = false;
-  hostPeerId = null;
   mySeat = null;
   latestSnapshot = createEmptySnapshot();
 
@@ -554,102 +305,48 @@ async function leaveRoom(silent = false) {
   if (!silent) setStatus("已離開房間。");
 }
 
-function stopTimers() {
-  if (heartbeatTimer) clearInterval(heartbeatTimer);
-  if (staleCleanupTimer) clearInterval(staleCleanupTimer);
-  heartbeatTimer = null;
-  staleCleanupTimer = null;
-}
-
-function startTimers() {
-  stopTimers();
-  heartbeatTimer = setInterval(() => {
-    if (!activeRoomId) return;
-    if (isHost) {
-      updateSeatHeartbeat(uid, myDisplayName, peer?.id);
-      publishSnapshot();
-    } else if (hostConnection?.open) {
-      safeSend(hostConnection, {
-        type: "heartbeat",
-        payload: { uid, name: myDisplayName, peerId: peer?.id }
-      });
+/* --- 自動清理斷線玩家遺留的標記 --- */
+function autoCleanupOrphanedGrid(currentSeats, currentGrid) {
+  if (!mySeat) return; // 只有在房間裡的人需要幫忙清
+  
+  const updates = {};
+  let needsCleanup = false;
+  
+  Object.keys(currentGrid).forEach(key => {
+    const ownerSeat = currentGrid[key];
+    if (!currentSeats[ownerSeat]) {
+      updates[key] = null;
+      needsCleanup = true;
     }
-  }, HEARTBEAT_MS);
+  });
 
-  if (isHost) {
-    staleCleanupTimer = setInterval(() => {
-      if (!activeRoomId) return;
-      cleanupStaleSeats();
-      publishSnapshot();
-    }, HEARTBEAT_MS);
+  if (needsCleanup) {
+    update(ref(db, `rooms/${activeRoomId}/grid`), updates);
   }
 }
 
-function resetBoard() {
-  if (!activeRoomId || !mySeat) {
-    setStatus("請先加入房間。");
-    return;
-  }
-  if (isHost) {
-    applyResetFromUser(uid);
-    publishSnapshot();
-    setStatus("已重置。");
-  } else if (hostConnection?.open) {
-    safeSend(hostConnection, { type: "reset", payload: { uid } });
-    setStatus("已送出重置請求。");
-  }
-}
-
-function handleBoardClick(event) {
-  const button = event.target.closest("button.cell");
-  if (!button || !activeRoomId || !mySeat) return;
-
-  const clickedSeat = Number(button.dataset.seat);
-  const level = Number(button.dataset.level);
-
-  if (isHost) {
-    applySetCellFromUser(uid, level, clickedSeat);
-    publishSnapshot();
-  } else if (hostConnection?.open) {
-    safeSend(hostConnection, {
-      type: "set-cell",
-      payload: { uid, level, seat: clickedSeat }
-    });
-  }
-}
-
-function getSeatByUid(targetUid, seats = latestSnapshot.seats) {
-  for (const seat of [1, 2, 3, 4]) {
-    if (seats[seat]?.uid === targetUid) return seat;
-  }
-  return null;
-}
-
+/* --- 工具函式 --- */
 function createEmptySnapshot() {
-  return { seats: {}, grid: {}, hostPeerId: "", ts: Date.now() };
+  return { seats: {}, grid: {} };
 }
 
 function createRoomId() {
-  const arr = new Uint32Array(4);
+  const arr = new Uint32Array(2);
   crypto.getRandomValues(arr);
-  return `${arr[0].toString(36)}-${arr[1].toString(36)}-${arr[2].toString(36)}-${arr[3].toString(36)}`;
+  return `${arr[0].toString(36)}-${arr[1].toString(36)}`.slice(0, 11);
 }
 
 function sanitizeRoomId(input) {
-  return String(input).trim().toLowerCase().replace(/[^a-z0-9-_]/g, "").slice(0, 48);
+  return String(input).trim().toLowerCase().replace(/[^a-z0-9-_]/g, "").slice(0, 32);
 }
 
 function getOrCreateClientId() {
   const key = "board-client-id";
   const cached = sessionStorage.getItem(key);
   if (cached) return cached;
-  const id = `u-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+  const id = `u-${Math.random().toString(36).slice(2, 10)}`;
   sessionStorage.setItem(key, id);
   return id;
-}
-
-function makeHostPeerId(roomId) {
-  return `room-${roomId}-host`;
 }
 
 function getSeatDisplayName(seat, seatData) {
@@ -665,72 +362,21 @@ function escapeHtml(text) {
   return String(text)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
+    .replaceAll(">", "&gt;");
 }
 
-function waitForConnectionOpen(conn, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    let done = false;
-    const timeout = setTimeout(() => {
-      if (done) return;
-      done = true;
-      reject(new Error("連線逾時，找不到房主。"));
-    }, timeoutMs);
-
-    conn.on("open", () => {
-      if (done) return;
-      done = true;
-      clearTimeout(timeout);
-      resolve();
-    });
-
-    conn.on("error", (error) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timeout);
-      reject(error || new Error("房間連線失敗。"));
-    });
-  });
-}
-
-// 【修改點】把 PEER_CONFIG 放進來套用 STUN Server
-function openPeerWithId(id) {
-  return new Promise((resolve, reject) => {
-    const instance = new Peer(id, PEER_CONFIG);
-    let resolved = false;
-
-    instance.on("open", () => {
-      resolved = true;
-      resolve(instance);
-    });
-
-    instance.on("error", (error) => {
-      if (resolved) return;
-      instance.destroy();
-      reject(error || new Error("Peer 初始化失敗"));
-    });
-  });
-}
-
-// 【修改點】把 PEER_CONFIG 放進來套用 STUN Server
-function openPeerRandom() {
-  return new Promise((resolve, reject) => {
-    const instance = new Peer(PEER_CONFIG);
-    let resolved = false;
-
-    instance.on("open", () => {
-      resolved = true;
-      resolve(instance);
-    });
-
-    instance.on("error", (error) => {
-      if (resolved) return;
-      instance.destroy();
-      reject(error || new Error("Peer 初始化失敗"));
-    });
-  });
+async function copyRoomId() {
+  const roomId = roomInput.value.trim();
+  if (!roomId) return setStatus("目前沒有可複製的房號。");
+  try {
+    await navigator.clipboard.writeText(roomId);
+    setStatus("房號已複製。");
+  } catch {
+    roomInput.focus();
+    roomInput.select();
+    document.execCommand("copy");
+    setStatus("房號已複製。");
+  }
 }
 
 window.addEventListener("beforeunload", () => leaveRoom(true));
